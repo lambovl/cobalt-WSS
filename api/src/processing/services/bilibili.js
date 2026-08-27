@@ -24,7 +24,7 @@ function extractStreamDataFromHTML(html) {
     const data = JSON.parse(rawStreamData);
     if (data.code !== 0) return;
 
-    return data; 
+    return data;
 }
 
 async function fetchStreamDataFromAPI(html) {
@@ -32,7 +32,7 @@ async function fetchStreamDataFromAPI(html) {
     const initialStateHtml = html.split('<script>window.__INITIAL_STATE__=')[1]?.split(';(function()')[0];
     if (!initialStateHtml) return;
     const { aid, bvid, cid } = JSON.parse(initialStateHtml);
-    
+
     const params = new URLSearchParams({
         aid,
         bvid,
@@ -47,7 +47,7 @@ async function fetchStreamDataFromAPI(html) {
         }
     }).then(r => r.json()).catch(() => {});
     if (!playinfo || playinfo.code !== 0) return;
-    
+
     return playinfo;
 }
 
