@@ -1,8 +1,8 @@
 import HLS from "hls-parser";
 import ivm from "isolated-vm";
 
-import { fetch, Request } from "undici";
-import { Innertube, Platform, Session } from "youtubei.js";
+import { fetch, Headers, Request } from "undici";
+import { Constants, Innertube, Platform, Session } from "youtubei.js";
 
 import { env } from "../../config.js";
 import { getCookie } from "../cookie/manager.js";
@@ -23,8 +23,14 @@ Platform.shim.eval = async (data) => {
 }
 
 const PLAYER_REFRESH_PERIOD = 1000 * 60 * 15; // ms
+const VISITOR_DATA_REFRESH_PERIOD = 1000 * 60 * 5; // ms
 
-let innertube, lastRefreshedAt;
+const ANDROID_VR_CLIENT = "ANDROID_VR";
+const YOUTUBE_WEB_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)";
+
+let innertube, lastRefreshedAt, lastVisitorData;
+let cachedVisitorData, visitorDataRefreshedAt;
 
 const codecList = {
     h264: {
@@ -57,12 +63,51 @@ const hlsCodecList = {
     }
 }
 
-const clientsWithNoCipher = ['IOS', 'ANDROID', 'YTSTUDIO_ANDROID', 'YTMUSIC_ANDROID'];
+const clientsWithNoCipher = [
+    'IOS',
+    'ANDROID',
+    ANDROID_VR_CLIENT,
+    'YTSTUDIO_ANDROID',
+    'YTMUSIC_ANDROID'
+];
 
 const videoQualities = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320];
 
-const cloneInnertube = async (customFetch, useSession) => {
-    const shouldRefreshPlayer = lastRefreshedAt + PLAYER_REFRESH_PERIOD < new Date();
+const getVisitorData = async (videoId, dispatcher) => {
+    const visitorDataIsFresh = cachedVisitorData
+        && visitorDataRefreshedAt + VISITOR_DATA_REFRESH_PERIOD > Date.now();
+
+    if (visitorDataIsFresh) return cachedVisitorData;
+
+    const watchUrl = new URL("https://www.youtube.com/watch");
+    watchUrl.searchParams.set("v", videoId);
+    watchUrl.searchParams.set("bpctr", "9999999999");
+    watchUrl.searchParams.set("has_verified", "1");
+
+    const page = await fetch(watchUrl, {
+        dispatcher,
+        headers: {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Cookie": "PREF=hl=en&tz=UTC; SOCS=CAI",
+            "User-Agent": YOUTUBE_WEB_USER_AGENT,
+        }
+    }).then(response => response.ok ? response.text() : undefined)
+      .catch(() => {});
+
+    const visitorData = page?.match(/(?:"VISITOR_DATA"|"visitorData"):"([^"]+)"/)?.[1];
+
+    if (visitorData) {
+        cachedVisitorData = visitorData;
+        visitorDataRefreshedAt = Date.now();
+    }
+
+    return visitorData;
+}
+
+const cloneInnertube = async (customFetch, useSession, visitorData) => {
+    const shouldRefreshPlayer = lastRefreshedAt + PLAYER_REFRESH_PERIOD < new Date()
+        || (visitorData && visitorData !== lastVisitorData);
 
     const rawCookie = getCookie('youtube');
     const cookie = rawCookie?.toString();
@@ -87,10 +132,11 @@ const cloneInnertube = async (customFetch, useSession) => {
             retrieve_player,
             cookie,
             po_token: useSession ? sessionTokens?.potoken : undefined,
-            visitor_data: useSession ? sessionTokens?.visitor_data : undefined,
+            visitor_data: useSession ? sessionTokens?.visitor_data : visitorData,
             player_id,
         });
         lastRefreshedAt = +new Date();
+        lastVisitorData = visitorData;
     }
 
     const session = new Session(
@@ -226,6 +272,10 @@ export default async function (o) {
         innertubeClient = env.ytSessionInnertubeClient || "WEB_EMBEDDED";
     }
 
+    const visitorData = innertubeClient === ANDROID_VR_CLIENT
+        ? await getVisitorData(o.id, o.dispatcher)
+        : undefined;
+
     let yt;
     try {
         yt = await cloneInnertube(
@@ -242,12 +292,20 @@ export default async function (o) {
                     ? input : undefined
                 );
 
+                const headers = new Headers(init?.headers ?? request.headers);
+
+                if (innertubeClient === ANDROID_VR_CLIENT) {
+                    headers.set("User-Agent", Constants.CLIENTS.ANDROID_VR.USER_AGENT);
+                }
+
                 return fetch(request, {
                     ...init,
+                    headers,
                     dispatcher: o.dispatcher
                 });
             },
-            useSession
+            useSession,
+            visitorData
         );
     } catch (e) {
         if (e === "no_session_tokens") {
