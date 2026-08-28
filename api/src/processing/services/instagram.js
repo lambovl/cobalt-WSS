@@ -144,13 +144,19 @@ export default function instagram(obj) {
             dispatcher
         }).then(r => r.text()).catch(() => {});
 
-        let embedData = JSON.parse(data?.match(/"init",\[\],\[(.*?)\]\],/)[1]);
+        // instagram often serves an empty embed shell with no data in it at all,
+        // which used to throw here and abort the whole chain of fallbacks
+        const embedJSON = data?.match(/"init",\[\],\[(.*?)\]\],/)?.[1];
+        if (!embedJSON) return false;
 
-        if (!embedData || !embedData?.contextJSON) return false;
+        try {
+            const embedData = JSON.parse(embedJSON);
+            if (!embedData?.contextJSON) return false;
 
-        embedData = JSON.parse(embedData.contextJSON);
-
-        return embedData;
+            return JSON.parse(embedData.contextJSON);
+        } catch {
+            return false;
+        }
     }
 
     async function getGQLParams(id, cookie) {
@@ -416,9 +422,35 @@ export default function instagram(obj) {
     }
 
     async function getPost(id, alwaysProxy) {
-        const hasData = (data) => data
-                                    && data.gql_data !== null
-                                    && data?.gql_data?.xdt_shortcode_media !== null;
+        // logged out responses regularly describe a video but omit its url. we
+        // won't hand out the cover image in place of the video that was asked
+        // for, but a source further down the chain may still have the real
+        // thing, so we only give up once every option is exhausted.
+        let videoWithoutURL = false;
+
+        // the graphql api and the html embed wrap the media in `gql_data`, while
+        // the mobile api returns the media object itself. a rejected graphql
+        // request still parses as valid json (`{"require_login": true, ...}`),
+        // so we have to look for the media instead of assuming that a response
+        // which isn't literally `null` is a usable one.
+        const hasData = (data) => {
+            if (!data) return false;
+
+            if ('gql_data' in data) {
+                const media = data.gql_data?.shortcode_media || data.gql_data?.xdt_shortcode_media;
+                if (!media) return false;
+
+                // multiposts carry `is_video` on their children, not here
+                if (media.is_video && !media.video_url && !media.edge_sidecar_to_children) {
+                    videoWithoutURL = true;
+                    return false;
+                }
+
+                return true;
+            }
+
+            return !!(data.carousel_media || data.video_versions || data.image_versions2);
+        }
         let data, result;
         try {
             const cookie = getCookie('instagram');
@@ -438,16 +470,19 @@ export default function instagram(obj) {
             if (media_id && !hasData(data)) data = await requestMobileApi(media_id);
             if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
 
-            // web app graphql api (no cookie, cookie)
-            if (!hasData(data)) data = await requestGQL(id);
-            if (!hasData(data) && cookie) data = await requestGQL(id, cookie);
-
             // html embed (no cookie, cookie)
             if (!hasData(data)) data = await requestHTML(id);
             if (!hasData(data) && cookie) data = await requestHTML(id, cookie);
+
+            // web app graphql api. anonymous requests are rejected outright with
+            // `require_login`, and every attempt pulls a ~1mb post page just to
+            // scrape its parameters, which only brings the rate limit closer.
+            // so it's only worth asking when we have a cookie to authenticate with.
+            if (!hasData(data) && cookie) data = await requestGQL(id, cookie);
         } catch {}
 
         if (!hasData(data)) {
+            if (videoWithoutURL) return { error: "content.video.unavailable" };
             return getErrorContext(id);
         }
 
