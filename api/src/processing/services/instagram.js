@@ -40,6 +40,16 @@ const embedHeaders = {
     "User-Agent": genericUserAgent,
 }
 
+// instagram serves the full media payload to search crawlers on the regular
+// post page, while ordinary user agents get a shell with nothing in it.
+// only the complete canonical googlebot string works: "Googlebot" or
+// "Googlebot/2.1" on their own get the same empty shell as everyone else.
+const crawlerHeaders = {
+    "user-agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+}
+
 const cachedDtsg = {
     value: '',
     expiry: 0
@@ -54,6 +64,23 @@ const getObjectFromEntries = (name, data) => {
     const obj = data?.match(new RegExp('\\["' + name + '",.*?,({.*?}),\\d+\\]'))?.[1];
     return obj && JSON.parse(obj);
 }
+
+const findKey = (node, key) => {
+    if (!node || typeof node !== 'object') return;
+
+    if (node[key] !== undefined) return node[key];
+
+    for (const value of Object.values(node)) {
+        const found = findKey(value, key);
+        if (found !== undefined) return found;
+    }
+}
+
+// not every source reports dimensions. when none of them do we keep whatever
+// came first, since they arrive ordered best-first
+const bestQuality = (versions) => versions.reduce(
+    (a, b) => (a.width * a.height || 0) < (b.width * b.height || 0) ? b : a
+);
 
 export default function instagram(obj) {
     const dispatcher = obj.dispatcher;
@@ -133,6 +160,33 @@ export default function instagram(obj) {
         }).then(r => r.json()).catch(() => {});
 
         return mediaInfo?.items?.[0];
+    }
+
+    async function requestCrawlerPage(id) {
+        const html = await fetch(`https://www.instagram.com/p/${id}/`, {
+            headers: crawlerHeaders,
+            dispatcher
+        }).then(r => r.text()).catch(() => {});
+
+        if (!html) return false;
+
+        const blocks = html.matchAll(/<script type="application\/json"[^>]*>(.*?)<\/script>/gs);
+
+        for (const [, blob] of blocks) {
+            if (!blob.includes('"xig_polaris_media"')) continue;
+
+            try {
+                const media = findKey(JSON.parse(blob), 'xig_polaris_media');
+
+                // what instagram would show a logged out visitor
+                // if the post weren't gated behind a login
+                if (media?.if_not_gated_logged_out) {
+                    return media.if_not_gated_logged_out;
+                }
+            } catch {}
+        }
+
+        return false;
     }
 
     async function requestHTML(id, cookie) {
@@ -378,8 +432,7 @@ export default function instagram(obj) {
                     let itemExt = type === "video" ? "mp4" : "jpg";
 
                     if (type === "video") {
-                        const video = e.video_versions.reduce((a, b) => a.width * a.height < b.width * b.height ? b : a);
-                        url = video.url;
+                        url = bestQuality(e.video_versions).url;
                     }
 
                     let proxyFile;
@@ -406,7 +459,7 @@ export default function instagram(obj) {
 
             if (picker.length) return { picker }
         } else if (data.video_versions) {
-            const video = data.video_versions.reduce((a, b) => a.width * a.height < b.width * b.height ? b : a)
+            const video = bestQuality(data.video_versions);
             return {
                 urls: video.url,
                 filename: `instagram_${id}.mp4`,
@@ -469,6 +522,12 @@ export default function instagram(obj) {
             // mobile api (no cookie, cookie)
             if (media_id && !hasData(data)) data = await requestMobileApi(media_id);
             if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
+
+            // crawler view of the post page. this is the only source that still
+            // hands a logged out request an actual video url, so it goes before
+            // the embed. it's deliberately anonymous: sending a cookie along with
+            // a googlebot user-agent would be incoherent.
+            if (!hasData(data)) data = await requestCrawlerPage(id);
 
             // html embed (no cookie, cookie)
             if (!hasData(data)) data = await requestHTML(id);
@@ -536,7 +595,7 @@ export default function instagram(obj) {
         if (!item) return { error: "fetch.empty" };
 
         if (item.video_versions) {
-            const video = item.video_versions.reduce((a, b) => a.width * a.height < b.width * b.height ? b : a)
+            const video = bestQuality(item.video_versions);
             return {
                 urls: video.url,
                 filename: `instagram_${id}.mp4`,
